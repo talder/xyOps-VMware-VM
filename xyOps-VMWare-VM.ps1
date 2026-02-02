@@ -23,6 +23,32 @@ function Send-Error {
     Write-Output-JSON @{ xy = 1; code = $Code; description = $Description }
 }
 
+function Test-SnapshotException {
+    param(
+        [string]$SnapshotName,
+        [string]$SnapshotDescription,
+        [string]$ExceptionList
+    )
+    
+    # If no exceptions provided, don't skip
+    if ([string]::IsNullOrWhiteSpace($ExceptionList)) {
+        return $false
+    }
+    
+    # Parse comma-separated exception strings
+    $exceptions = $ExceptionList -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    
+    # Check if snapshot name or description contains any exception string (case-insensitive)
+    foreach ($exception in $exceptions) {
+        if ($SnapshotName -match [regex]::Escape($exception) -or 
+            $SnapshotDescription -match [regex]::Escape($exception)) {
+            return $true
+        }
+    }
+    
+    return $false
+}
+
 # Read input from STDIN
 $inputJson = [Console]::In.ReadToEnd()
 
@@ -57,6 +83,10 @@ function Get-ParamValue {
 # Check if debug mode is enabled
 $debugRaw = Get-ParamValue -ParamsObject $params -ParamName 'debug'
 $debug = if ($debugRaw -eq $true -or $debugRaw -eq "true" -or $debugRaw -eq "True") { $true } else { $false }
+
+# Performance tracking
+$perf = @{}
+$overallSW = [System.Diagnostics.Stopwatch]::StartNew()
 
 # If debug is enabled, output the incoming JSON
 if ($debug) {
@@ -97,6 +127,15 @@ $exportToFileRaw = Get-ParamValue -ParamsObject $params -ParamName 'exporttofile
 $exportToFile = if ($exportToFileRaw -eq $true -or $exportToFileRaw -eq "true" -or $exportToFileRaw -eq "True") { $true } else { $false }
 $dateInput = Get-ParamValue -ParamsObject $params -ParamName 'dateinput'
 $numberOfWeeks = Get-ParamValue -ParamsObject $params -ParamName 'numberofweeks'
+$snapshotRemovalException = Get-ParamValue -ParamsObject $params -ParamName 'snapshotremovalexception'
+$vmName = Get-ParamValue -ParamsObject $params -ParamName 'vmname'
+$snapshotName = Get-ParamValue -ParamsObject $params -ParamName 'snapshotname'
+$snapshotDescription = Get-ParamValue -ParamsObject $params -ParamName 'snapshotdescription'
+$snapshotMemoryRaw = Get-ParamValue -ParamsObject $params -ParamName 'snapshotmemory'
+$snapshotMemory = if ($snapshotMemoryRaw -eq $true -or $snapshotMemoryRaw -eq "true" -or $snapshotMemoryRaw -eq "True") { $true } else { $false }
+$snapshotUnique = Get-ParamValue -ParamsObject $params -ParamName 'snapshotunique'
+$updateVCFPowerCLIRaw = Get-ParamValue -ParamsObject $params -ParamName 'updateVCFPowerCLI'
+$updateVCFPowerCLI = if ($updateVCFPowerCLIRaw -eq $true -or $updateVCFPowerCLIRaw -eq "true" -or $updateVCFPowerCLIRaw -eq "True") { $true } else { $false }
 
 # Validate required parameters
 $missing = @()
@@ -128,10 +167,24 @@ if ($selectedAction -and $selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE 
     }
 }
 
-# Check numberOfWeeks if action is 'Remove VM snapshots before number of weeks'
-if ($selectedAction -and $selectedAction.ToUpper() -eq "REMOVE VM SNAPSHOTS BEFORE NUMBER OF WEEKS") {
+# Check numberOfWeeks if action is 'Remove snapshots before number of weeks'
+if ($selectedAction -and $selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE NUMBER OF WEEKS") {
     if ([string]::IsNullOrWhiteSpace($numberOfWeeks)) {
         $missing += 'numberofweeks'
+    }
+}
+
+# Check vmname if action is 'Create VM snapshot'
+if ($selectedAction -and $selectedAction.ToUpper() -eq "CREATE VM SNAPSHOT") {
+    if ([string]::IsNullOrWhiteSpace($vmName)) {
+        $missing += 'vmname'
+    }
+}
+
+# Check snapshotname if action is 'Remove snapshots containing specific text'
+if ($selectedAction -and $selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS CONTAINING SPECIFIC TEXT") {
+    if ([string]::IsNullOrWhiteSpace($snapshotName)) {
+        $missing += 'snapshotname'
     }
 }
 
@@ -143,6 +196,8 @@ if ($missing.Count -gt 0) {
 try {
     # Check if VCF.PowerCLI module is installed
     Send-Progress -Value 0.1
+    
+    $moduleInstallSW = [System.Diagnostics.Stopwatch]::StartNew()
     
     $powerCLIModule = Get-Module -ListAvailable -Name VCF.PowerCLI | Select-Object -First 1
     
@@ -160,28 +215,56 @@ try {
     } else {
         Write-Host "VCF.PowerCLI module found: Version $($powerCLIModule.Version)"
         
-        # Check if an update is available and install with -SkipPublisherCheck if needed
-        try {
-            $latestVersion = Find-Module -Name VCF.PowerCLI -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($latestVersion -and $latestVersion.Version -gt $powerCLIModule.Version) {
-                Write-Host "Updating VCF.PowerCLI from version $($powerCLIModule.Version) to $($latestVersion.Version)..."
-                Update-Module -Name VCF.PowerCLI -Force -SkipPublisherCheck -ErrorAction Stop
-                Write-Host "VCF.PowerCLI module updated successfully"
+        # Check if an update is available (only if updateVCFPowerCLI parameter is enabled)
+        if ($updateVCFPowerCLI) {
+            Write-Host "Update check enabled - checking for VCF.PowerCLI updates..."
+            try {
+                $latestVersion = Find-Module -Name VCF.PowerCLI -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($latestVersion -and $latestVersion.Version -gt $powerCLIModule.Version) {
+                    Write-Host "Updating VCF.PowerCLI from version $($powerCLIModule.Version) to $($latestVersion.Version)..."
+                    Update-Module -Name VCF.PowerCLI -Force -SkipPublisherCheck -ErrorAction Stop
+                    Write-Host "VCF.PowerCLI module updated successfully"
+                } else {
+                    Write-Host "VCF.PowerCLI is already up-to-date (version $($powerCLIModule.Version))"
+                }
             }
-        }
-        catch {
-            # Update failed, but we can continue with existing version
-            Write-Host "Could not update VCF.PowerCLI module, using existing version $($powerCLIModule.Version)"
+            catch {
+                # Update failed, but we can continue with existing version
+                Write-Host "Could not update VCF.PowerCLI module, using existing version $($powerCLIModule.Version)"
+            }
+        } else {
+            Write-Host "Update check disabled - using existing VCF.PowerCLI version $($powerCLIModule.Version)"
         }
     }
     
-    # Import VCF.PowerCLI module
+    $moduleInstallSW.Stop(); $perf.module_install = [math]::Round($moduleInstallSW.Elapsed.TotalSeconds,3); if ($debug) { Write-Host ("PERF module_install={0:n3}s" -f $perf.module_install) }
+    
+    # Import only the Core PowerCLI module for faster startup (keep VCF.PowerCLI for install/update checks)
     Send-Progress -Value 0.2
-    Import-Module VCF.PowerCLI -ErrorAction Stop
-    Write-Host "VCF.PowerCLI module loaded successfully"
+    $moduleImportSW = [System.Diagnostics.Stopwatch]::StartNew()
+    
+    $loadedCore = Get-Module -Name VMware.VimAutomation.Core
+    if (-not $loadedCore) {
+        Write-Host "Loading VMware.VimAutomation.Core module (optimized path)..."
+        try {
+            Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+            $loadedCore = Get-Module -Name VMware.VimAutomation.Core
+            Write-Host "VMware.VimAutomation.Core loaded successfully (version $($loadedCore.Version))"
+        }
+        catch {
+            Write-Host "Failed to load VMware.VimAutomation.Core directly: $($_.Exception.Message). Falling back to VCF.PowerCLI import..."
+            # Fallback to umbrella module if direct Core import fails
+            Import-Module VCF.PowerCLI -ErrorAction Stop
+            Write-Host "VCF.PowerCLI module loaded successfully (fallback)"
+        }
+    } else {
+        Write-Host "VMware.VimAutomation.Core already loaded (version $($loadedCore.Version))"
+    }
+    $moduleImportSW.Stop(); $perf.module_import = [math]::Round($moduleImportSW.Elapsed.TotalSeconds,3); if ($debug) { Write-Host ("PERF module_import={0:n3}s" -f $perf.module_import) }
     
     # Configure PowerCLI settings
     Send-Progress -Value 0.3
+    $configSW = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Host "Configuring PowerCLI settings..."
     
     # Determine InvalidCertificateAction
@@ -195,18 +278,39 @@ try {
     
     Write-Host "PowerCLI Config: InvalidCertificateAction=$certAction, ProxyPolicy=$proxyPolicy, DefaultVIServerMode=$viServerMode"
     
-    Set-PowerCLIConfiguration -Scope User `
-        -ParticipateInCEIP $false `
-        -InvalidCertificateAction $certAction `
-        -Confirm:$false `
-        -ProxyPolicy $proxyPolicy `
-        -DefaultVIServerMode $viServerMode `
-        -ErrorAction Stop | Out-Null
-    
-    Write-Host "PowerCLI configuration completed"
+    # Only set configuration if values differ (to avoid slow disk writes every run)
+    $currentCfg = Get-PowerCLIConfiguration -Scope User -ErrorAction SilentlyContinue | Select-Object -First 1
+    $currentInvalid = $null; if ($currentCfg) { $currentInvalid = $currentCfg.InvalidCertificateAction }
+    $currentProxy = $null; if ($currentCfg) { $currentProxy = $currentCfg.ProxyPolicy }
+    $currentMode = $null; if ($currentCfg) { $currentMode = $currentCfg.DefaultVIServerMode }
+    $currentCeip = $null; if ($currentCfg) {
+        if ($currentCfg.PSObject.Properties.Name -contains 'ParticipateInCEIP') { $currentCeip = $currentCfg.ParticipateInCEIP }
+        elseif ($currentCfg.PSObject.Properties.Name -contains 'ParticipatingInCEIP') { $currentCeip = $currentCfg.ParticipatingInCEIP }
+    }
+    $needsCfgUpdate = $false
+    if ($currentInvalid -ne $certAction) { $needsCfgUpdate = $true }
+    if ($currentProxy -ne $proxyPolicy) { $needsCfgUpdate = $true }
+    if ($currentMode -ne $viServerMode) { $needsCfgUpdate = $true }
+    if ($null -ne $currentCeip -and $currentCeip -ne $false) { $needsCfgUpdate = $true }
+
+    if ($needsCfgUpdate) {
+        Set-PowerCLIConfiguration -Scope User `
+            -ParticipateInCEIP $false `
+            -InvalidCertificateAction $certAction `
+            -Confirm:$false `
+            -ProxyPolicy $proxyPolicy `
+            -DefaultVIServerMode $viServerMode `
+            -ErrorAction Stop | Out-Null
+        Write-Host "PowerCLI configuration updated"
+    } else {
+        Write-Host "PowerCLI configuration already matches desired settings (no changes)"
+    }
+
+    $configSW.Stop(); $perf.config = [math]::Round($configSW.Elapsed.TotalSeconds,3); if ($debug) { Write-Host ("PERF config={0:n3}s" -f $perf.config) }
     
     # Connect to vCenter
     Send-Progress -Value 0.4
+    $connectSW = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Host "Connecting to vCenter: $vcenterServer"
     
     $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
@@ -220,6 +324,7 @@ try {
         Send-Error -Code 4 -Description "Failed to connect to vCenter server '$vcenterServer': $($_.Exception.Message)"
         exit 1
     }
+    $connectSW.Stop(); $perf.connect = [math]::Round($connectSW.Elapsed.TotalSeconds,3); if ($debug) { Write-Host ("PERF connect={0:n3}s" -f $perf.connect) }
     
     Send-Progress -Value 0.5
     
@@ -227,6 +332,7 @@ try {
     Write-Host "Executing action: $selectedAction"
     
     $actionData = @{}
+    $actionSW = [System.Diagnostics.Stopwatch]::StartNew()
     
     switch ($selectedAction.ToUpper()) {
         "LIST VMS" {
@@ -329,10 +435,115 @@ try {
             exit 1
         }
         
-        "SNAPSHOT VM" {
-            # TODO: Implement snapshot VM functionality
-            Send-Error -Code 5 -Description "Action 'Snapshot VM' is not yet implemented"
-            exit 1
+        "CREATE VM SNAPSHOT" {
+            Write-Host "Creating snapshot(s) for VM(s): $vmName..."
+            
+            # Parse VM names (comma-separated)
+            $vmNames = $vmName -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            
+            if ($vmNames.Count -eq 0) {
+                Send-Error -Code 9 -Description "No valid VM names provided. Please specify at least one VM name."
+                exit 1
+            }
+            
+            # Generate base snapshot name if not provided
+            $baseSnapshotName = if ([string]::IsNullOrWhiteSpace($snapshotName)) {
+                $timestamp = Get-Date -Format "yyyyMMddHHmmss"
+                "xyOps-VMWare-VM-$timestamp"
+            } else {
+                $snapshotName
+            }
+            
+            # Generate unique identifier based on selection
+            $uniqueIdentifier = ""
+            if (-not [string]::IsNullOrWhiteSpace($snapshotUnique) -and $snapshotUnique -ne "No") {
+                if ($snapshotUnique -eq "Unique short UID") {
+                    # Generate GUID and take first 8 characters
+                    $guid = [System.Guid]::NewGuid().ToString("N")
+                    $uniqueIdentifier = "-" + $guid.Substring(0, 8)
+                } elseif ($snapshotUnique -eq "Timestamp") {
+                    # Generate timestamp
+                    $timestamp = Get-Date -Format "yyyyMMddHHmmss"
+                    $uniqueIdentifier = "-$timestamp"
+                }
+            }
+            
+            # Build final snapshot name
+            $finalSnapshotName = $baseSnapshotName + $uniqueIdentifier
+            
+            # Determine snapshot description
+            $finalDescription = if ([string]::IsNullOrWhiteSpace($snapshotDescription)) {
+                if ($uniqueIdentifier -ne "") {
+                    "xyOps-VMWare-VM added a custom snapshot with a unique identifier"
+                } else {
+                    "xyOps-VMWare-VM snapshot"
+                }
+            } else {
+                $snapshotDescription
+            }
+            
+            Write-Host "Snapshot Name: $finalSnapshotName"
+            Write-Host "Description: $finalDescription"
+            Write-Host "Memory Snapshot: $snapshotMemory"
+            Write-Host "Target VMs: $($vmNames -join ', ')"
+            
+            $createdSnapshots = @()
+            $failedSnapshots = @()
+            
+            foreach ($vmNameItem in $vmNames) {
+                try {
+                    Write-Host "Processing VM: $vmNameItem..."
+                    
+                    # Get the VM object
+                    $vm = Get-VM -Name $vmNameItem -Server $viConnection -ErrorAction Stop
+                    
+                    # Create the snapshot
+                    Write-Host "Creating snapshot '$finalSnapshotName' for VM '$vmNameItem'..."
+                    $snapshot = New-Snapshot -VM $vm -Name $finalSnapshotName -Description $finalDescription -Memory:$snapshotMemory -Quiesce:$false -ErrorAction Stop
+                    
+                    $snapshotInfo = @{
+                        VMName = $vm.Name
+                        SnapshotName = $snapshot.Name
+                        Description = $snapshot.Description
+                        Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                        SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                        Memory = $snapshotMemory
+                        Status = "Success"
+                        Message = "Snapshot created successfully"
+                    }
+                    $createdSnapshots += $snapshotInfo
+                    Write-Host "Successfully created snapshot '$finalSnapshotName' for VM '$vmNameItem'"
+                }
+                catch {
+                    $failedInfo = @{
+                        VMName = $vmNameItem
+                        SnapshotName = $finalSnapshotName
+                        Description = $finalDescription
+                        Memory = $snapshotMemory
+                        Status = "Failed"
+                        Message = $_.Exception.Message
+                    }
+                    $failedSnapshots += $failedInfo
+                    Write-Host "Failed to create snapshot for VM '$vmNameItem': $($_.Exception.Message)"
+                }
+            }
+            
+            $actionData = @{
+                action = "CreateVMSnapshot"
+                vcenterServer = $vcenterServer
+                snapshotName = $finalSnapshotName
+                description = $finalDescription
+                memory = $snapshotMemory
+                uniqueIdentifier = $snapshotUnique
+                targetVMs = $vmNames
+                createdCount = $createdSnapshots.Count
+                failedCount = $failedSnapshots.Count
+                totalProcessed = $createdSnapshots.Count + $failedSnapshots.Count
+                createdSnapshots = $createdSnapshots
+                failedSnapshots = $failedSnapshots
+            }
+            
+            Write-Host "Snapshot creation completed: $($createdSnapshots.Count) created, $($failedSnapshots.Count) failed"
         }
         
         "REMOVE SNAPSHOTS BEFORE DATE" {
@@ -379,6 +590,7 @@ try {
             
             $removedSnapshots = @()
             $failedRemovals = @()
+            $skippedSnapshots = @()
             
             foreach ($vm in $allVMs) {
                 $snapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
@@ -386,6 +598,22 @@ try {
                 if ($snapshots) {
                     foreach ($snapshot in $snapshots) {
                         if ($snapshot.Created -lt $targetDate) {
+                            # Check if snapshot matches exception criteria
+                            $shouldSkip = Test-SnapshotException -SnapshotName $snapshot.Name -SnapshotDescription $snapshot.Description -ExceptionList $snapshotRemovalException
+                            
+                            if ($shouldSkip) {
+                                Write-Host "Skipping snapshot '$($snapshot.Name)' from VM '$($vm.Name)' (matches exception criteria)"
+                                $skippedInfo = @{
+                                    VMName = $vm.Name
+                                    SnapshotName = $snapshot.Name
+                                    Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                                    SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                                    Reason = "Matches exception criteria"
+                                }
+                                $skippedSnapshots += $skippedInfo
+                                continue
+                            }
+                            
                             Write-Host "Removing snapshot '$($snapshot.Name)' from VM '$($vm.Name)' (Created: $($snapshot.Created.ToString('yyyy-MM-dd HH:mm:ss')))..."
                             
                             try {
@@ -425,15 +653,17 @@ try {
                 targetDate = $targetDate.ToString("yyyy-MM-dd HH:mm:ss")
                 removedCount = $removedSnapshots.Count
                 failedCount = $failedRemovals.Count
+                skippedCount = $skippedSnapshots.Count
                 totalProcessed = $removedSnapshots.Count + $failedRemovals.Count
                 removedSnapshots = $removedSnapshots
                 failedRemovals = $failedRemovals
+                skippedSnapshots = $skippedSnapshots
             }
             
-            Write-Host "Snapshot removal completed: $($removedSnapshots.Count) removed, $($failedRemovals.Count) failed"
+            Write-Host "Snapshot removal completed: $($removedSnapshots.Count) removed, $($failedRemovals.Count) failed, $($skippedSnapshots.Count) skipped"
         }
         
-        "REMOVE VM SNAPSHOTS BEFORE NUMBER OF WEEKS" {
+        "REMOVE SNAPSHOTS BEFORE NUMBER OF WEEKS" {
             Write-Host "Removing snapshots older than $numberOfWeeks weeks..."
             
             # Validate numberOfWeeks is a valid number
@@ -457,6 +687,7 @@ try {
             
             $removedSnapshots = @()
             $failedRemovals = @()
+            $skippedSnapshots = @()
             
             foreach ($vm in $allVMs) {
                 $snapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
@@ -464,6 +695,24 @@ try {
                 if ($snapshots) {
                     foreach ($snapshot in $snapshots) {
                         if ($snapshot.Created -lt $targetDate) {
+                            # Check if snapshot matches exception criteria
+                            $shouldSkip = Test-SnapshotException -SnapshotName $snapshot.Name -SnapshotDescription $snapshot.Description -ExceptionList $snapshotRemovalException
+                            
+                            if ($shouldSkip) {
+                                Write-Host "Skipping snapshot '$($snapshot.Name)' from VM '$($vm.Name)' (matches exception criteria)"
+                                $ageInDays = [math]::Round(((Get-Date) - $snapshot.Created).TotalDays, 1)
+                                $skippedInfo = @{
+                                    VMName = $vm.Name
+                                    SnapshotName = $snapshot.Name
+                                    Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                                    AgeDays = $ageInDays
+                                    SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                                    Reason = "Matches exception criteria"
+                                }
+                                $skippedSnapshots += $skippedInfo
+                                continue
+                            }
+                            
                             $ageInDays = [math]::Round(((Get-Date) - $snapshot.Created).TotalDays, 1)
                             Write-Host "Removing snapshot '$($snapshot.Name)' from VM '$($vm.Name)' (Created: $($snapshot.Created.ToString('yyyy-MM-dd HH:mm:ss')), Age: $ageInDays days)..."
                             
@@ -507,19 +756,190 @@ try {
                 targetDate = $targetDate.ToString("yyyy-MM-dd HH:mm:ss")
                 removedCount = $removedSnapshots.Count
                 failedCount = $failedRemovals.Count
+                skippedCount = $skippedSnapshots.Count
                 totalProcessed = $removedSnapshots.Count + $failedRemovals.Count
                 removedSnapshots = $removedSnapshots
                 failedRemovals = $failedRemovals
+                skippedSnapshots = $skippedSnapshots
             }
             
-            Write-Host "Snapshot removal completed: $($removedSnapshots.Count) removed, $($failedRemovals.Count) failed"
+            Write-Host "Snapshot removal completed: $($removedSnapshots.Count) removed, $($failedRemovals.Count) failed, $($skippedSnapshots.Count) skipped"
+        }
+        
+        "REMOVE ALL SNAPSHOTS" {
+            Write-Host "Removing ALL snapshots from all VMs..."
+            
+            $allVMs = Get-VM -Server $viConnection | Sort-Object Name
+            
+            $removedSnapshots = @()
+            $failedRemovals = @()
+            $skippedSnapshots = @()
+            
+            foreach ($vm in $allVMs) {
+                $snapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
+                
+                if ($snapshots) {
+                    foreach ($snapshot in $snapshots) {
+                        # Check if snapshot matches exception criteria
+                        $shouldSkip = Test-SnapshotException -SnapshotName $snapshot.Name -SnapshotDescription $snapshot.Description -ExceptionList $snapshotRemovalException
+                        
+                        if ($shouldSkip) {
+                            Write-Host "Skipping snapshot '$($snapshot.Name)' from VM '$($vm.Name)' (matches exception criteria)"
+                            $ageInDays = [math]::Round(((Get-Date) - $snapshot.Created).TotalDays, 1)
+                            $skippedInfo = @{
+                                VMName = $vm.Name
+                                SnapshotName = $snapshot.Name
+                                Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                                AgeDays = $ageInDays
+                                SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                                Reason = "Matches exception criteria"
+                            }
+                            $skippedSnapshots += $skippedInfo
+                            continue
+                        }
+                        
+                        $ageInDays = [math]::Round(((Get-Date) - $snapshot.Created).TotalDays, 1)
+                        Write-Host "Removing snapshot '$($snapshot.Name)' from VM '$($vm.Name)' (Created: $($snapshot.Created.ToString('yyyy-MM-dd HH:mm:ss')), Age: $ageInDays days)..."
+                        
+                        try {
+                            Remove-Snapshot -Snapshot $snapshot -Confirm:$false -ErrorAction Stop
+                            
+                            $removedInfo = @{
+                                VMName = $vm.Name
+                                SnapshotName = $snapshot.Name
+                                Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                                AgeDays = $ageInDays
+                                SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                                Status = "Success"
+                                Message = "Successfully removed"
+                            }
+                            $removedSnapshots += $removedInfo
+                            Write-Host "Successfully removed snapshot '$($snapshot.Name)' from VM '$($vm.Name)'"
+                        }
+                        catch {
+                            $failedInfo = @{
+                                VMName = $vm.Name
+                                SnapshotName = $snapshot.Name
+                                Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                                AgeDays = $ageInDays
+                                SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                                Status = "Failed"
+                                Message = $_.Exception.Message
+                            }
+                            $failedRemovals += $failedInfo
+                            Write-Host "Failed to remove snapshot '$($snapshot.Name)' from VM '$($vm.Name)': $($_.Exception.Message)"
+                        }
+                    }
+                }
+            }
+            
+            $actionData = @{
+                action = "RemoveAllSnapshots"
+                vcenterServer = $vcenterServer
+                removedCount = $removedSnapshots.Count
+                failedCount = $failedRemovals.Count
+                skippedCount = $skippedSnapshots.Count
+                totalProcessed = $removedSnapshots.Count + $failedRemovals.Count
+                removedSnapshots = $removedSnapshots
+                failedRemovals = $failedRemovals
+                skippedSnapshots = $skippedSnapshots
+            }
+            
+            Write-Host "Snapshot removal completed: $($removedSnapshots.Count) removed, $($failedRemovals.Count) failed, $($skippedSnapshots.Count) skipped"
+        }
+        
+        "REMOVE SNAPSHOTS CONTAINING SPECIFIC TEXT" {
+            Write-Host "Removing snapshots containing text: '$snapshotName'..."
+            
+            $allVMs = Get-VM -Server $viConnection | Sort-Object Name
+            
+            $removedSnapshots = @()
+            $failedRemovals = @()
+            $skippedSnapshots = @()
+            
+            foreach ($vm in $allVMs) {
+                $snapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
+                
+                if ($snapshots) {
+                    foreach ($snapshot in $snapshots) {
+                        # Check if snapshot name contains the search text (case-insensitive)
+                        if ($snapshot.Name -like "*$snapshotName*") {
+                            # Check if snapshot matches exception criteria
+                            $shouldSkip = Test-SnapshotException -SnapshotName $snapshot.Name -SnapshotDescription $snapshot.Description -ExceptionList $snapshotRemovalException
+                            
+                            if ($shouldSkip) {
+                                Write-Host "Skipping snapshot '$($snapshot.Name)' from VM '$($vm.Name)' (matches exception criteria)"
+                                $ageInDays = [math]::Round(((Get-Date) - $snapshot.Created).TotalDays, 1)
+                                $skippedInfo = @{
+                                    VMName = $vm.Name
+                                    SnapshotName = $snapshot.Name
+                                    Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                                    AgeDays = $ageInDays
+                                    SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                                    Reason = "Matches exception criteria"
+                                }
+                                $skippedSnapshots += $skippedInfo
+                                continue
+                            }
+                            
+                            $ageInDays = [math]::Round(((Get-Date) - $snapshot.Created).TotalDays, 1)
+                            Write-Host "Removing snapshot '$($snapshot.Name)' from VM '$($vm.Name)' (matches text: '$snapshotName')..."
+                            
+                            try {
+                                Remove-Snapshot -Snapshot $snapshot -Confirm:$false -ErrorAction Stop
+                                
+                                $removedInfo = @{
+                                    VMName = $vm.Name
+                                    SnapshotName = $snapshot.Name
+                                    Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                                    AgeDays = $ageInDays
+                                    SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                                    Status = "Success"
+                                    Message = "Successfully removed"
+                                }
+                                $removedSnapshots += $removedInfo
+                                Write-Host "Successfully removed snapshot '$($snapshot.Name)' from VM '$($vm.Name)'"
+                            }
+                            catch {
+                                $failedInfo = @{
+                                    VMName = $vm.Name
+                                    SnapshotName = $snapshot.Name
+                                    Created = $snapshot.Created.ToString("yyyy-MM-dd HH:mm:ss")
+                                    AgeDays = $ageInDays
+                                    SizeGB = [math]::Round($snapshot.SizeGB, 2)
+                                    Status = "Failed"
+                                    Message = $_.Exception.Message
+                                }
+                                $failedRemovals += $failedInfo
+                                Write-Host "Failed to remove snapshot '$($snapshot.Name)' from VM '$($vm.Name)': $($_.Exception.Message)"
+                            }
+                        }
+                    }
+                }
+            }
+            
+            $actionData = @{
+                action = "RemoveSnapshotsContainingText"
+                vcenterServer = $vcenterServer
+                searchText = $snapshotName
+                removedCount = $removedSnapshots.Count
+                failedCount = $failedRemovals.Count
+                skippedCount = $skippedSnapshots.Count
+                totalProcessed = $removedSnapshots.Count + $failedRemovals.Count
+                removedSnapshots = $removedSnapshots
+                failedRemovals = $failedRemovals
+                skippedSnapshots = $skippedSnapshots
+            }
+            
+            Write-Host "Snapshot removal completed: $($removedSnapshots.Count) removed, $($failedRemovals.Count) failed, $($skippedSnapshots.Count) skipped"
         }
         
         default {
-            Send-Error -Code 6 -Description "Unknown action: $selectedAction. Valid actions are: ListVMs, ListSnapshots, RemoveSnapshotsBeforeDate, RemoveVMSnapshotsBeforeNumberOfWeeks, RebootVM, StopVM, SnapshotVM"
+            Send-Error -Code 6 -Description "Unknown action: $selectedAction. Valid actions are: ListVMs, ListSnapshots, CreateVMSnapshot, RemoveSnapshotsBeforeDate, RemoveSnapshotsBeforeNumberOfWeeks, RemoveAllSnapshots, RemoveSnapshotsContainingSpecificText, RebootVM, StopVM"
             exit 1
         }
     }
+    $actionSW.Stop(); $perf.action = [math]::Round($actionSW.Elapsed.TotalSeconds,3); if ($debug) { Write-Host ("PERF action={0:n3}s" -f $perf.action) }
     
     Send-Progress -Value 0.7
     
@@ -556,7 +976,7 @@ try {
         # Display snapshot removal results
         $markdownContent += "## Snapshot Removal Summary`n`n"
         $markdownContent += "**Target Date**: $($actionData.targetDate)`n`n"
-        $markdownContent += "**Removed**: $($actionData.removedCount) | **Failed**: $($actionData.failedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
+        $markdownContent += "**Removed**: $($actionData.removedCount) | **Failed**: $($actionData.failedCount) | **Skipped**: $($actionData.skippedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
         
         if ($actionData.removedSnapshots.Count -gt 0) {
             $markdownContent += "## Successfully Removed Snapshots ($($actionData.removedCount))`n`n"
@@ -565,6 +985,17 @@ try {
             
             foreach ($snapshot in $actionData.removedSnapshots) {
                 $markdownContent += "| **$($snapshot.VMName)** | $($snapshot.SnapshotName) | $($snapshot.Created) | $($snapshot.SizeGB) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.skippedSnapshots.Count -gt 0) {
+            $markdownContent += "## Skipped Snapshots ($($actionData.skippedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Size (GB) | Reason |`n"
+            $markdownContent += "|---------|---------------|---------|-----------|--------|`n"
+            
+            foreach ($skipped in $actionData.skippedSnapshots) {
+                $markdownContent += "| **$($skipped.VMName)** | $($skipped.SnapshotName) | $($skipped.Created) | $($skipped.SizeGB) | $($skipped.Reason) |`n"
             }
             $markdownContent += "`n"
         }
@@ -584,12 +1015,12 @@ try {
             $markdownContent += "## No Snapshots Found`n`n"
             $markdownContent += "No snapshots were found before the target date $($actionData.targetDate).`n`n"
         }
-    } elseif ($selectedAction.ToUpper() -eq "REMOVE VM SNAPSHOTS BEFORE NUMBER OF WEEKS") {
+    } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE NUMBER OF WEEKS") {
         # Display snapshot removal results for weeks-based removal
         $markdownContent += "## Snapshot Removal Summary`n`n"
         $markdownContent += "**Number of Weeks**: $($actionData.numberOfWeeks) week(s)`n`n"
         $markdownContent += "**Target Date**: $($actionData.targetDate) (snapshots older than this are removed)`n`n"
-        $markdownContent += "**Removed**: $($actionData.removedCount) | **Failed**: $($actionData.failedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
+        $markdownContent += "**Removed**: $($actionData.removedCount) | **Failed**: $($actionData.failedCount) | **Skipped**: $($actionData.skippedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
         
         if ($actionData.removedSnapshots.Count -gt 0) {
             $markdownContent += "## Successfully Removed Snapshots ($($actionData.removedCount))`n`n"
@@ -598,6 +1029,17 @@ try {
             
             foreach ($snapshot in $actionData.removedSnapshots) {
                 $markdownContent += "| **$($snapshot.VMName)** | $($snapshot.SnapshotName) | $($snapshot.Created) | $($snapshot.AgeDays) | $($snapshot.SizeGB) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.skippedSnapshots.Count -gt 0) {
+            $markdownContent += "## Skipped Snapshots ($($actionData.skippedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) | Reason |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|--------|`n"
+            
+            foreach ($skipped in $actionData.skippedSnapshots) {
+                $markdownContent += "| **$($skipped.VMName)** | $($skipped.SnapshotName) | $($skipped.Created) | $($skipped.AgeDays) | $($skipped.SizeGB) | $($skipped.Reason) |`n"
             }
             $markdownContent += "`n"
         }
@@ -616,6 +1058,128 @@ try {
         if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
             $markdownContent += "## No Snapshots Found`n`n"
             $markdownContent += "No snapshots older than $($actionData.numberOfWeeks) week(s) were found.`n`n"
+        }
+    } elseif ($selectedAction.ToUpper() -eq "REMOVE ALL SNAPSHOTS") {
+        # Display snapshot removal results for all snapshots
+        $markdownContent += "## Snapshot Removal Summary`n`n"
+        $markdownContent += "**Action**: Remove ALL Snapshots`n`n"
+        $markdownContent += "**Removed**: $($actionData.removedCount) | **Failed**: $($actionData.failedCount) | **Skipped**: $($actionData.skippedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
+        
+        if ($actionData.removedSnapshots.Count -gt 0) {
+            $markdownContent += "## Successfully Removed Snapshots ($($actionData.removedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|`n"
+            
+            foreach ($snapshot in $actionData.removedSnapshots) {
+                $markdownContent += "| **$($snapshot.VMName)** | $($snapshot.SnapshotName) | $($snapshot.Created) | $($snapshot.AgeDays) | $($snapshot.SizeGB) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.skippedSnapshots.Count -gt 0) {
+            $markdownContent += "## Skipped Snapshots ($($actionData.skippedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) | Reason |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|--------|`n"
+            
+            foreach ($skipped in $actionData.skippedSnapshots) {
+                $markdownContent += "| **$($skipped.VMName)** | $($skipped.SnapshotName) | $($skipped.Created) | $($skipped.AgeDays) | $($skipped.SizeGB) | $($skipped.Reason) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.failedRemovals.Count -gt 0) {
+            $markdownContent += "## Failed Removals ($($actionData.failedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) | Error Message |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|---------------|`n"
+            
+            foreach ($failed in $actionData.failedRemovals) {
+                $markdownContent += "| **$($failed.VMName)** | $($failed.SnapshotName) | $($failed.Created) | $($failed.AgeDays) | $($failed.SizeGB) | $($failed.Message) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
+            $markdownContent += "## No Snapshots Found`n`n"
+            $markdownContent += "No snapshots were found in the vCenter environment.`n`n"
+        }
+    } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS CONTAINING SPECIFIC TEXT") {
+        # Display snapshot removal results for text-based search
+        $markdownContent += "## Snapshot Removal Summary`n`n"
+        $markdownContent += "**Search Text**: $($actionData.searchText)`n`n"
+        $markdownContent += "**Removed**: $($actionData.removedCount) | **Failed**: $($actionData.failedCount) | **Skipped**: $($actionData.skippedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
+        
+        if ($actionData.removedSnapshots.Count -gt 0) {
+            $markdownContent += "## Successfully Removed Snapshots ($($actionData.removedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|`n"
+            
+            foreach ($snapshot in $actionData.removedSnapshots) {
+                $markdownContent += "| **$($snapshot.VMName)** | $($snapshot.SnapshotName) | $($snapshot.Created) | $($snapshot.AgeDays) | $($snapshot.SizeGB) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.skippedSnapshots.Count -gt 0) {
+            $markdownContent += "## Skipped Snapshots ($($actionData.skippedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) | Reason |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|--------|`n"
+            
+            foreach ($skipped in $actionData.skippedSnapshots) {
+                $markdownContent += "| **$($skipped.VMName)** | $($skipped.SnapshotName) | $($skipped.Created) | $($skipped.AgeDays) | $($skipped.SizeGB) | $($skipped.Reason) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.failedRemovals.Count -gt 0) {
+            $markdownContent += "## Failed Removals ($($actionData.failedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) | Error Message |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|---------------|`n"
+            
+            foreach ($failed in $actionData.failedRemovals) {
+                $markdownContent += "| **$($failed.VMName)** | $($failed.SnapshotName) | $($failed.Created) | $($failed.AgeDays) | $($failed.SizeGB) | $($failed.Message) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
+            $markdownContent += "## No Snapshots Found`n`n"
+            $markdownContent += "No snapshots containing the text '$($actionData.searchText)' were found.`n`n"
+        }
+    } elseif ($selectedAction.ToUpper() -eq "CREATE VM SNAPSHOT") {
+        # Display snapshot creation results
+        $markdownContent += "## Snapshot Creation Summary`n`n"
+        $markdownContent += "**Snapshot Name**: $($actionData.snapshotName)`n`n"
+        $markdownContent += "**Description**: $($actionData.description)`n`n"
+        $markdownContent += "**Memory Snapshot**: $($actionData.memory)`n`n"
+        $markdownContent += "**Unique Identifier**: $($actionData.uniqueIdentifier)`n`n"
+        $markdownContent += "**Created**: $($actionData.createdCount) | **Failed**: $($actionData.failedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
+        
+        if ($actionData.createdSnapshots.Count -gt 0) {
+            $markdownContent += "## Successfully Created Snapshots ($($actionData.createdCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Description | Created | Size (GB) | Memory |`n"
+            $markdownContent += "|---------|---------------|-------------|---------|-----------|--------|`n"
+            
+            foreach ($snapshot in $actionData.createdSnapshots) {
+                $memoryIcon = if ($snapshot.Memory) { "✓" } else { "✗" }
+                $markdownContent += "| **$($snapshot.VMName)** | $($snapshot.SnapshotName) | $($snapshot.Description) | $($snapshot.Created) | $($snapshot.SizeGB) | $memoryIcon |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.failedSnapshots.Count -gt 0) {
+            $markdownContent += "## Failed Snapshot Creations ($($actionData.failedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Error Message |`n"
+            $markdownContent += "|---------|---------------|---------------|`n"
+            
+            foreach ($failed in $actionData.failedSnapshots) {
+                $markdownContent += "| **$($failed.VMName)** | $($failed.SnapshotName) | $($failed.Message) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.createdCount -eq 0 -and $actionData.failedCount -gt 0) {
+            $markdownContent += "## No Snapshots Created`n`n"
+            $markdownContent += "All snapshot creation attempts failed. Please check the error messages above.`n`n"
         }
     } elseif ($selectedAction.ToUpper() -eq "LIST VMS") {
         # Separate VMs by power state
@@ -653,13 +1217,21 @@ try {
         }
     }
     
+    $outputSW = [System.Diagnostics.Stopwatch]::StartNew()
+
     # Always output the Markdown for display in xyOps GUI
     if ($selectedAction.ToUpper() -eq "LIST SNAPSHOTS") {
         $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | Snapshots: $($actionData.snapshotCount) from $($actionData.vmWithSnapshotsCount) VM(s)"
     } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE DATE") {
-        $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | Removed: $($actionData.removedCount), Failed: $($actionData.failedCount)"
-    } elseif ($selectedAction.ToUpper() -eq "REMOVE VM SNAPSHOTS BEFORE NUMBER OF WEEKS") {
-        $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | Weeks: $($actionData.numberOfWeeks) | Removed: $($actionData.removedCount), Failed: $($actionData.failedCount)"
+        $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | Removed: $($actionData.removedCount), Failed: $($actionData.failedCount), Skipped: $($actionData.skippedCount)"
+    } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE NUMBER OF WEEKS") {
+        $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | Weeks: $($actionData.numberOfWeeks) | Removed: $($actionData.removedCount), Failed: $($actionData.failedCount), Skipped: $($actionData.skippedCount)"
+    } elseif ($selectedAction.ToUpper() -eq "REMOVE ALL SNAPSHOTS") {
+        $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | Removed: $($actionData.removedCount), Failed: $($actionData.failedCount), Skipped: $($actionData.skippedCount)"
+    } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS CONTAINING SPECIFIC TEXT") {
+        $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | Search: '$($actionData.searchText)' | Removed: $($actionData.removedCount), Failed: $($actionData.failedCount), Skipped: $($actionData.skippedCount)"
+    } elseif ($selectedAction.ToUpper() -eq "CREATE VM SNAPSHOT") {
+        $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | Created: $($actionData.createdCount), Failed: $($actionData.failedCount)"
     } else {
         $caption = "vCenter: $($actionData.vcenterServer) | Action: $($actionData.action) | VMs: $($actionData.vmCount)"
     }
@@ -735,18 +1307,62 @@ try {
                 foreach ($snapshot in $actionData.removedSnapshots) {
                     $csvContent += "`"$($snapshot.VMName)`",`"$($snapshot.SnapshotName)`",`"$($snapshot.Created)`",$($snapshot.SizeGB),`"$($snapshot.Status)`",`"$($snapshot.Message)`"`n"
                 }
+                foreach ($skipped in $actionData.skippedSnapshots) {
+                    $csvContent += "`"$($skipped.VMName)`",`"$($skipped.SnapshotName)`",`"$($skipped.Created)`",$($skipped.SizeGB),`"Skipped`",`"$($skipped.Reason)`"`n"
+                }
                 foreach ($failed in $actionData.failedRemovals) {
                     $csvContent += "`"$($failed.VMName)`",`"$($failed.SnapshotName)`",`"$($failed.Created)`",$($failed.SizeGB),`"$($failed.Status)`",`"$($failed.Message)`"`n"
                 }
                 $csvContent = $csvContent.TrimEnd("`n")
-            } elseif ($selectedAction.ToUpper() -eq "REMOVE VM SNAPSHOTS BEFORE NUMBER OF WEEKS") {
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE NUMBER OF WEEKS") {
                 # CSV for removed snapshots (weeks-based)
                 $csvContent = "VMName,SnapshotName,Created,AgeDays,SizeGB,Status,Message`n"
                 foreach ($snapshot in $actionData.removedSnapshots) {
                     $csvContent += "`"$($snapshot.VMName)`",`"$($snapshot.SnapshotName)`",`"$($snapshot.Created)`",$($snapshot.AgeDays),$($snapshot.SizeGB),`"$($snapshot.Status)`",`"$($snapshot.Message)`"`n"
                 }
+                foreach ($skipped in $actionData.skippedSnapshots) {
+                    $csvContent += "`"$($skipped.VMName)`",`"$($skipped.SnapshotName)`",`"$($skipped.Created)`",$($skipped.AgeDays),$($skipped.SizeGB),`"Skipped`",`"$($skipped.Reason)`"`n"
+                }
                 foreach ($failed in $actionData.failedRemovals) {
                     $csvContent += "`"$($failed.VMName)`",`"$($failed.SnapshotName)`",`"$($failed.Created)`",$($failed.AgeDays),$($failed.SizeGB),`"$($failed.Status)`",`"$($failed.Message)`"`n"
+                }
+                $csvContent = $csvContent.TrimEnd("`n")
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE ALL SNAPSHOTS") {
+                # CSV for removed all snapshots
+                $csvContent = "VMName,SnapshotName,Created,AgeDays,SizeGB,Status,Message`n"
+                foreach ($snapshot in $actionData.removedSnapshots) {
+                    $csvContent += "`"$($snapshot.VMName)`",`"$($snapshot.SnapshotName)`",`"$($snapshot.Created)`",$($snapshot.AgeDays),$($snapshot.SizeGB),`"$($snapshot.Status)`",`"$($snapshot.Message)`"`n"
+                }
+                foreach ($skipped in $actionData.skippedSnapshots) {
+                    $csvContent += "`"$($skipped.VMName)`",`"$($skipped.SnapshotName)`",`"$($skipped.Created)`",$($skipped.AgeDays),$($skipped.SizeGB),`"Skipped`",`"$($skipped.Reason)`"`n"
+                }
+                foreach ($failed in $actionData.failedRemovals) {
+                    $csvContent += "`"$($failed.VMName)`",`"$($failed.SnapshotName)`",`"$($failed.Created)`",$($failed.AgeDays),$($failed.SizeGB),`"$($failed.Status)`",`"$($failed.Message)`"`n"
+                }
+                $csvContent = $csvContent.TrimEnd("`n")
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS CONTAINING SPECIFIC TEXT") {
+                # CSV for removed snapshots containing text
+                $csvContent = "VMName,SnapshotName,Created,AgeDays,SizeGB,Status,Message`n"
+                foreach ($snapshot in $actionData.removedSnapshots) {
+                    $csvContent += "`"$($snapshot.VMName)`",`"$($snapshot.SnapshotName)`",`"$($snapshot.Created)`",$($snapshot.AgeDays),$($snapshot.SizeGB),`"$($snapshot.Status)`",`"$($snapshot.Message)`"`n"
+                }
+                foreach ($skipped in $actionData.skippedSnapshots) {
+                    $csvContent += "`"$($skipped.VMName)`",`"$($skipped.SnapshotName)`",`"$($skipped.Created)`",$($skipped.AgeDays),$($skipped.SizeGB),`"Skipped`",`"$($skipped.Reason)`"`n"
+                }
+                foreach ($failed in $actionData.failedRemovals) {
+                    $csvContent += "`"$($failed.VMName)`",`"$($failed.SnapshotName)`",`"$($failed.Created)`",$($failed.AgeDays),$($failed.SizeGB),`"$($failed.Status)`",`"$($failed.Message)`"`n"
+                }
+                $csvContent = $csvContent.TrimEnd("`n")
+            } elseif ($selectedAction.ToUpper() -eq "CREATE VM SNAPSHOT") {
+                # CSV for created snapshots
+                $csvContent = "VMName,SnapshotName,Description,Created,SizeGB,Memory,Status,Message`n"
+                foreach ($snapshot in $actionData.createdSnapshots) {
+                    $memoryStr = if ($snapshot.Memory) { "Yes" } else { "No" }
+                    $csvContent += "`"$($snapshot.VMName)`",`"$($snapshot.SnapshotName)`",`"$($snapshot.Description)`",`"$($snapshot.Created)`",$($snapshot.SizeGB),`"$memoryStr`",`"$($snapshot.Status)`",`"$($snapshot.Message)`"`n"
+                }
+                foreach ($failed in $actionData.failedSnapshots) {
+                    $memoryStr = if ($failed.Memory) { "Yes" } else { "No" }
+                    $csvContent += "`"$($failed.VMName)`",`"$($failed.SnapshotName)`",`"$($failed.Description)`",`"`",$memoryStr,`"$($failed.Status)`",`"$($failed.Message)`"`n"
                 }
                 $csvContent = $csvContent.TrimEnd("`n")
             }
@@ -823,7 +1439,7 @@ try {
                 $markdownContent += "## No Snapshots Found`n`n"
                 $markdownContent += "No snapshots were found before the target date $($actionData.targetDate).`n`n"
             }
-            } elseif ($selectedAction.ToUpper() -eq "REMOVE VM SNAPSHOTS BEFORE NUMBER OF WEEKS") {
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE NUMBER OF WEEKS") {
         # Display snapshot removal results for weeks-based removal
         $markdownContent += "## Snapshot Removal Summary`n`n"
         $markdownContent += "**Number of Weeks**: $($actionData.numberOfWeeks) week(s)`n`n"
@@ -855,6 +1471,117 @@ try {
             if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
                 $markdownContent += "## No Snapshots Found`n`n"
                 $markdownContent += "No snapshots older than $($actionData.numberOfWeeks) week(s) were found.`n`n"
+            }
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE ALL SNAPSHOTS") {
+        # Display snapshot removal results for all snapshots
+        $markdownContent += "## Snapshot Removal Summary`n`n"
+        $markdownContent += "**Action**: Remove ALL Snapshots`n`n"
+        $markdownContent += "**Removed**: $($actionData.removedCount) | **Failed**: $($actionData.failedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
+        
+        if ($actionData.removedSnapshots.Count -gt 0) {
+            $markdownContent += "## Successfully Removed Snapshots ($($actionData.removedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|`n"
+            
+            foreach ($snapshot in $actionData.removedSnapshots) {
+                $markdownContent += "| **$($snapshot.VMName)** | $($snapshot.SnapshotName) | $($snapshot.Created) | $($snapshot.AgeDays) | $($snapshot.SizeGB) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.failedRemovals.Count -gt 0) {
+            $markdownContent += "## Failed Removals ($($actionData.failedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) | Error Message |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|---------------|`n"
+            
+            foreach ($failed in $actionData.failedRemovals) {
+                $markdownContent += "| **$($failed.VMName)** | $($failed.SnapshotName) | $($failed.Created) | $($failed.AgeDays) | $($failed.SizeGB) | $($failed.Message) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+            if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
+                $markdownContent += "## No Snapshots Found`n`n"
+                $markdownContent += "No snapshots were found in the vCenter environment.`n`n"
+            }
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS CONTAINING SPECIFIC TEXT") {
+        # Display snapshot removal results for text-based search
+        $markdownContent += "## Snapshot Removal Summary`n`n"
+        $markdownContent += "**Search Text**: $($actionData.searchText)`n`n"
+        $markdownContent += "**Removed**: $($actionData.removedCount) | **Failed**: $($actionData.failedCount) | **Skipped**: $($actionData.skippedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
+        
+        if ($actionData.removedSnapshots.Count -gt 0) {
+            $markdownContent += "## Successfully Removed Snapshots ($($actionData.removedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|`n"
+            
+            foreach ($snapshot in $actionData.removedSnapshots) {
+                $markdownContent += "| **$($snapshot.VMName)** | $($snapshot.SnapshotName) | $($snapshot.Created) | $($snapshot.AgeDays) | $($snapshot.SizeGB) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.skippedSnapshots.Count -gt 0) {
+            $markdownContent += "## Skipped Snapshots ($($actionData.skippedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) | Reason |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|--------|`n"
+            
+            foreach ($skipped in $actionData.skippedSnapshots) {
+                $markdownContent += "| **$($skipped.VMName)** | $($skipped.SnapshotName) | $($skipped.Created) | $($skipped.AgeDays) | $($skipped.SizeGB) | $($skipped.Reason) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.failedRemovals.Count -gt 0) {
+            $markdownContent += "## Failed Removals ($($actionData.failedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Created | Age (Days) | Size (GB) | Error Message |`n"
+            $markdownContent += "|---------|---------------|---------|------------|-----------|---------------|`n"
+            
+            foreach ($failed in $actionData.failedRemovals) {
+                $markdownContent += "| **$($failed.VMName)** | $($failed.SnapshotName) | $($failed.Created) | $($failed.AgeDays) | $($failed.SizeGB) | $($failed.Message) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+            if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
+                $markdownContent += "## No Snapshots Found`n`n"
+                $markdownContent += "No snapshots containing the text '$($actionData.searchText)' were found.`n`n"
+            }
+            } elseif ($selectedAction.ToUpper() -eq "CREATE VM SNAPSHOT") {
+        # Display snapshot creation results
+        $markdownContent += "## Snapshot Creation Summary`n`n"
+        $markdownContent += "**Snapshot Name**: $($actionData.snapshotName)`n`n"
+        $markdownContent += "**Description**: $($actionData.description)`n`n"
+        $markdownContent += "**Memory Snapshot**: $($actionData.memory)`n`n"
+        $markdownContent += "**Unique Identifier**: $($actionData.uniqueIdentifier)`n`n"
+        $markdownContent += "**Created**: $($actionData.createdCount) | **Failed**: $($actionData.failedCount) | **Total Processed**: $($actionData.totalProcessed)`n`n"
+        
+        if ($actionData.createdSnapshots.Count -gt 0) {
+            $markdownContent += "## Successfully Created Snapshots ($($actionData.createdCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Description | Created | Size (GB) | Memory |`n"
+            $markdownContent += "|---------|---------------|-------------|---------|-----------|--------|`n"
+            
+            foreach ($snapshot in $actionData.createdSnapshots) {
+                $memoryIcon = if ($snapshot.Memory) { "✓" } else { "✗" }
+                $markdownContent += "| **$($snapshot.VMName)** | $($snapshot.SnapshotName) | $($snapshot.Description) | $($snapshot.Created) | $($snapshot.SizeGB) | $memoryIcon |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+        if ($actionData.failedSnapshots.Count -gt 0) {
+            $markdownContent += "## Failed Snapshot Creations ($($actionData.failedCount))`n`n"
+            $markdownContent += "| VM Name | Snapshot Name | Error Message |`n"
+            $markdownContent += "|---------|---------------|---------------|`n"
+            
+            foreach ($failed in $actionData.failedSnapshots) {
+                $markdownContent += "| **$($failed.VMName)** | $($failed.SnapshotName) | $($failed.Message) |`n"
+            }
+            $markdownContent += "`n"
+        }
+        
+            if ($actionData.createdCount -eq 0 -and $actionData.failedCount -gt 0) {
+                $markdownContent += "## No Snapshots Created`n`n"
+                $markdownContent += "All snapshot creation attempts failed. Please check the error messages above.`n`n"
             }
             } elseif ($selectedAction.ToUpper() -eq "LIST VMS") {
                 $markdownContent += "## Virtual Machines ($($actionData.vmCount))`n`n"
@@ -947,10 +1674,28 @@ try {
                 $htmlContent += "        <tr><td><strong>Removed</strong></td><td>$($actionData.removedCount)</td></tr>`n"
                 $htmlContent += "        <tr><td><strong>Failed</strong></td><td>$($actionData.failedCount)</td></tr>`n"
                 $htmlContent += "        <tr><td><strong>Total Processed</strong></td><td>$($actionData.totalProcessed)</td></tr>`n"
-            } elseif ($selectedAction.ToUpper() -eq "REMOVE VM SNAPSHOTS BEFORE NUMBER OF WEEKS") {
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE NUMBER OF WEEKS") {
                 $htmlContent += "        <tr><td><strong>Number of Weeks</strong></td><td>$($actionData.numberOfWeeks)</td></tr>`n"
                 $htmlContent += "        <tr><td><strong>Target Date</strong></td><td>$($actionData.targetDate)</td></tr>`n"
                 $htmlContent += "        <tr><td><strong>Removed</strong></td><td>$($actionData.removedCount)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Failed</strong></td><td>$($actionData.failedCount)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Total Processed</strong></td><td>$($actionData.totalProcessed)</td></tr>`n"
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE ALL SNAPSHOTS") {
+                $htmlContent += "        <tr><td><strong>Removed</strong></td><td>$($actionData.removedCount)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Failed</strong></td><td>$($actionData.failedCount)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Total Processed</strong></td><td>$($actionData.totalProcessed)</td></tr>`n"
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS CONTAINING SPECIFIC TEXT") {
+                $htmlContent += "        <tr><td><strong>Search Text</strong></td><td>$($actionData.searchText)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Removed</strong></td><td>$($actionData.removedCount)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Failed</strong></td><td>$($actionData.failedCount)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Skipped</strong></td><td>$($actionData.skippedCount)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Total Processed</strong></td><td>$($actionData.totalProcessed)</td></tr>`n"
+            } elseif ($selectedAction.ToUpper() -eq "CREATE VM SNAPSHOT") {
+                $htmlContent += "        <tr><td><strong>Snapshot Name</strong></td><td>$($actionData.snapshotName)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Description</strong></td><td>$($actionData.description)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Memory Snapshot</strong></td><td>$($actionData.memory)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Unique Identifier</strong></td><td>$($actionData.uniqueIdentifier)</td></tr>`n"
+                $htmlContent += "        <tr><td><strong>Created</strong></td><td>$($actionData.createdCount)</td></tr>`n"
                 $htmlContent += "        <tr><td><strong>Failed</strong></td><td>$($actionData.failedCount)</td></tr>`n"
                 $htmlContent += "        <tr><td><strong>Total Processed</strong></td><td>$($actionData.totalProcessed)</td></tr>`n"
             }
@@ -1024,6 +1769,19 @@ try {
                     $htmlContent += "    </table>`n"
                 }
                 
+                # Skipped snapshots table
+                if ($actionData.skippedSnapshots.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Skipped Snapshots ($($actionData.skippedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Created</th><th>Size (GB)</th><th>Reason</th></tr>`n"
+                    
+                    foreach ($skipped in $actionData.skippedSnapshots) {
+                        $htmlContent += "        <tr style='background-color: #ffffcc;'><td><strong>$($skipped.VMName)</strong></td><td>$($skipped.SnapshotName)</td><td>$($skipped.Created)</td><td>$($skipped.SizeGB)</td><td>$($skipped.Reason)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
                 # Failed removals table
                 if ($actionData.failedRemovals.Count -gt 0) {
                     $htmlContent += "`n    <h2>Failed Removals ($($actionData.failedCount))</h2>`n"
@@ -1041,7 +1799,7 @@ try {
                     $htmlContent += "`n    <h2>No Snapshots Found</h2>`n"
                     $htmlContent += "    <p>No snapshots were found before the target date $($actionData.targetDate).</p>`n"
                 }
-            } elseif ($selectedAction.ToUpper() -eq "REMOVE VM SNAPSHOTS BEFORE NUMBER OF WEEKS") {
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS BEFORE NUMBER OF WEEKS") {
                 # Removed snapshots table (weeks-based)
                 if ($actionData.removedSnapshots.Count -gt 0) {
                     $htmlContent += "`n    <h2>Successfully Removed Snapshots ($($actionData.removedCount))</h2>`n"
@@ -1050,6 +1808,19 @@ try {
                     
                     foreach ($snapshot in $actionData.removedSnapshots) {
                         $htmlContent += "        <tr><td><strong>$($snapshot.VMName)</strong></td><td>$($snapshot.SnapshotName)</td><td>$($snapshot.Created)</td><td>$($snapshot.AgeDays)</td><td>$($snapshot.SizeGB)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                # Skipped snapshots table
+                if ($actionData.skippedSnapshots.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Skipped Snapshots ($($actionData.skippedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Created</th><th>Age (Days)</th><th>Size (GB)</th><th>Reason</th></tr>`n"
+                    
+                    foreach ($skipped in $actionData.skippedSnapshots) {
+                        $htmlContent += "        <tr style='background-color: #ffffcc;'><td><strong>$($skipped.VMName)</strong></td><td>$($skipped.SnapshotName)</td><td>$($skipped.Created)</td><td>$($skipped.AgeDays)</td><td>$($skipped.SizeGB)</td><td>$($skipped.Reason)</td></tr>`n"
                     }
                     
                     $htmlContent += "    </table>`n"
@@ -1071,6 +1842,126 @@ try {
                 if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
                     $htmlContent += "`n    <h2>No Snapshots Found</h2>`n"
                     $htmlContent += "    <p>No snapshots older than $($actionData.numberOfWeeks) week(s) were found.</p>`n"
+                }
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE ALL SNAPSHOTS") {
+                # Removed all snapshots tables
+                if ($actionData.removedSnapshots.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Successfully Removed Snapshots ($($actionData.removedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Created</th><th>Age (Days)</th><th>Size (GB)</th></tr>`n"
+                    
+                    foreach ($snapshot in $actionData.removedSnapshots) {
+                        $htmlContent += "        <tr><td><strong>$($snapshot.VMName)</strong></td><td>$($snapshot.SnapshotName)</td><td>$($snapshot.Created)</td><td>$($snapshot.AgeDays)</td><td>$($snapshot.SizeGB)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                # Skipped snapshots table
+                if ($actionData.skippedSnapshots.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Skipped Snapshots ($($actionData.skippedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Created</th><th>Age (Days)</th><th>Size (GB)</th><th>Reason</th></tr>`n"
+                    
+                    foreach ($skipped in $actionData.skippedSnapshots) {
+                        $htmlContent += "        <tr style='background-color: #ffffcc;'><td><strong>$($skipped.VMName)</strong></td><td>$($skipped.SnapshotName)</td><td>$($skipped.Created)</td><td>$($skipped.AgeDays)</td><td>$($skipped.SizeGB)</td><td>$($skipped.Reason)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                # Failed removals table
+                if ($actionData.failedRemovals.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Failed Removals ($($actionData.failedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Created</th><th>Age (Days)</th><th>Size (GB)</th><th>Error Message</th></tr>`n"
+                    
+                    foreach ($failed in $actionData.failedRemovals) {
+                        $htmlContent += "        <tr style='background-color: #ffcccc;'><td><strong>$($failed.VMName)</strong></td><td>$($failed.SnapshotName)</td><td>$($failed.Created)</td><td>$($failed.AgeDays)</td><td>$($failed.SizeGB)</td><td>$($failed.Message)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
+                    $htmlContent += "`n    <h2>No Snapshots Found</h2>`n"
+                    $htmlContent += "    <p>No snapshots were found in the vCenter environment.</p>`n"
+                }
+            } elseif ($selectedAction.ToUpper() -eq "REMOVE SNAPSHOTS CONTAINING SPECIFIC TEXT") {
+                # Removed snapshots containing text tables
+                if ($actionData.removedSnapshots.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Successfully Removed Snapshots ($($actionData.removedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Created</th><th>Age (Days)</th><th>Size (GB)</th></tr>`n"
+                    
+                    foreach ($snapshot in $actionData.removedSnapshots) {
+                        $htmlContent += "        <tr><td><strong>$($snapshot.VMName)</strong></td><td>$($snapshot.SnapshotName)</td><td>$($snapshot.Created)</td><td>$($snapshot.AgeDays)</td><td>$($snapshot.SizeGB)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                # Skipped snapshots table
+                if ($actionData.skippedSnapshots.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Skipped Snapshots ($($actionData.skippedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Created</th><th>Age (Days)</th><th>Size (GB)</th><th>Reason</th></tr>`n"
+                    
+                    foreach ($skipped in $actionData.skippedSnapshots) {
+                        $htmlContent += "        <tr style='background-color: #ffffcc;'><td><strong>$($skipped.VMName)</strong></td><td>$($skipped.SnapshotName)</td><td>$($skipped.Created)</td><td>$($skipped.AgeDays)</td><td>$($skipped.SizeGB)</td><td>$($skipped.Reason)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                # Failed removals table
+                if ($actionData.failedRemovals.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Failed Removals ($($actionData.failedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Created</th><th>Age (Days)</th><th>Size (GB)</th><th>Error Message</th></tr>`n"
+                    
+                    foreach ($failed in $actionData.failedRemovals) {
+                        $htmlContent += "        <tr style='background-color: #ffcccc;'><td><strong>$($failed.VMName)</strong></td><td>$($failed.SnapshotName)</td><td>$($failed.Created)</td><td>$($failed.AgeDays)</td><td>$($failed.SizeGB)</td><td>$($failed.Message)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                if ($actionData.removedCount -eq 0 -and $actionData.failedCount -eq 0) {
+                    $htmlContent += "`n    <h2>No Snapshots Found</h2>`n"
+                    $htmlContent += "    <p>No snapshots containing the text '$($actionData.searchText)' were found.</p>`n"
+                }
+            } elseif ($selectedAction.ToUpper() -eq "CREATE VM SNAPSHOT") {
+                # Created snapshots table
+                if ($actionData.createdSnapshots.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Successfully Created Snapshots ($($actionData.createdCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Description</th><th>Created</th><th>Size (GB)</th><th>Memory</th></tr>`n"
+                    
+                    foreach ($snapshot in $actionData.createdSnapshots) {
+                        $memoryIcon = if ($snapshot.Memory) { "✓" } else { "✗" }
+                        $htmlContent += "        <tr><td><strong>$($snapshot.VMName)</strong></td><td>$($snapshot.SnapshotName)</td><td>$($snapshot.Description)</td><td>$($snapshot.Created)</td><td>$($snapshot.SizeGB)</td><td>$memoryIcon</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                # Failed snapshot creations table
+                if ($actionData.failedSnapshots.Count -gt 0) {
+                    $htmlContent += "`n    <h2>Failed Snapshot Creations ($($actionData.failedCount))</h2>`n"
+                    $htmlContent += "    <table>`n"
+                    $htmlContent += "        <tr><th>VM Name</th><th>Snapshot Name</th><th>Error Message</th></tr>`n"
+                    
+                    foreach ($failed in $actionData.failedSnapshots) {
+                        $htmlContent += "        <tr style='background-color: #ffcccc;'><td><strong>$($failed.VMName)</strong></td><td>$($failed.SnapshotName)</td><td>$($failed.Message)</td></tr>`n"
+                    }
+                    
+                    $htmlContent += "    </table>`n"
+                }
+                
+                if ($actionData.createdCount -eq 0 -and $actionData.failedCount -gt 0) {
+                    $htmlContent += "`n    <h2>No Snapshots Created</h2>`n"
+                    $htmlContent += "    <p>All snapshot creation attempts failed. Please check the error messages above.</p>`n"
                 }
             }
             
@@ -1119,10 +2010,19 @@ try {
             Write-Output-JSON $jsonData
         }
     }
+
+    $outputSW.Stop(); $perf.output = [math]::Round($outputSW.Elapsed.TotalSeconds,3); if ($debug) { Write-Host ("PERF output={0:n3}s" -f $perf.output) }
     
     # Disconnect from vCenter
     Disconnect-VIServer -Server $viConnection -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host "Disconnected from vCenter"
+
+    # Output performance metrics for xyOps pie chart
+    $overallSW.Stop(); $perf.t = [math]::Round($overallSW.Elapsed.TotalSeconds,3)
+    Write-Output-JSON @{ xy = 1; perf = $perf }
+    if ($debug) {
+        Write-Host ("PERF total={0:n3}s" -f $perf.t)
+    }
     
     # Success message
     $summary = "Operation '$selectedAction' completed successfully"
