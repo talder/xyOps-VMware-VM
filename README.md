@@ -1,3 +1,8 @@
+
+
+<p align="center"><img src="https://raw.githubusercontent.com/talder/xyOps-VMWare-VM/refs/heads/main/logo.png" height="108" alt="Logo"/></p>
+<h1 align="center">VMWare VM plugin</h1>
+
 # xyOps VMWare VM Operations Plugin
 
 A comprehensive VMware vCenter management plugin for xyOps that provides VM inventory, monitoring, and automated snapshot lifecycle management. Built with PowerShell and [VCF PowerCLI](https://developer.vmware.com/powercli), this plugin enables safe, automated operations across your VMware infrastructure with built-in protection for critical backup snapshots.
