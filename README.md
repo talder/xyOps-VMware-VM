@@ -5,7 +5,16 @@
 
 # xyOps VMware VM Operations Plugin
 
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/talder/xyOps-VMware-VM/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PowerShell](https://img.shields.io/badge/PowerShell-7.0+-blue.svg)](https://github.com/PowerShell/PowerShell)
+[![VCF.PowerCLI](https://img.shields.io/badge/VCF.PowerCLI-14.0+-green.svg)](https://developer.vmware.com/powercli)
+
 A comprehensive VMware vCenter management plugin for xyOps that provides VM inventory, monitoring, and snapshot lifecycle management. Built with PowerShell and [VCF PowerCLI](https://developer.vmware.com/powercli), this plugin enables automated operations across your VMware infrastructure for your virtual machines.
+
+## Disclaimer
+
+**USE AT YOUR OWN RISK.** This software is provided "as is", without warranty of any kind, express or implied. The author and contributors are not responsible for any damages, data loss, system downtime, or other issues that may arise from the use of this software. Always test in non-production environments before running against production systems. By using this plugin, you acknowledge that you have read, understood, and accepted this disclaimer.
 
 ## Features
 
@@ -649,7 +658,7 @@ Tim Alderweireldt
 
 ## Version
 
-1.0.0
+1.0.1
 
 ---
 
